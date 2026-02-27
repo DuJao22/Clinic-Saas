@@ -1,0 +1,5 @@
+{
+  "name": "Clinic SaaS Manager",
+  "description": "A complete SaaS web system for medical clinics with scheduling, EHR, and insurance management.",
+  "requestFramePermissions": []
+}

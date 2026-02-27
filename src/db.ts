@@ -1,16 +1,116 @@
 import Database from 'better-sqlite3';
+import { Database as SQLiteCloud } from '@sqlitecloud/drivers';
 import path from 'path';
 import fs from 'fs';
 
-const dbPath = path.join(process.cwd(), 'clinic.db');
-const db = new Database(dbPath);
+// Interface for our DB wrapper to support both local (sync-wrapped) and cloud (async)
+export interface IDatabase {
+  prepare(sql: string): {
+    run: (...args: any[]) => Promise<{ lastInsertRowid: number | bigint, changes: number }>;
+    get: (...args: any[]) => Promise<any>;
+    all: (...args: any[]) => Promise<any[]>;
+  };
+  transaction<T>(fn: () => Promise<T>): () => Promise<T>;
+  exec(sql: string): Promise<void>;
+}
 
-// Enable foreign keys
-db.pragma('foreign_keys = ON');
+class LocalDB implements IDatabase {
+  private db: Database.Database;
+  constructor(path: string) { 
+    this.db = new Database(path); 
+    this.db.pragma('foreign_keys = ON');
+  }
+  
+  prepare(sql: string) {
+    const stmt = this.db.prepare(sql);
+    return {
+      run: async (...args: any[]) => stmt.run(...args),
+      get: async (...args: any[]) => stmt.get(...args),
+      all: async (...args) => stmt.all(...args)
+    };
+  }
+  
+  transaction<T>(fn: () => Promise<T>) {
+    return async () => {
+      this.db.prepare('BEGIN').run();
+      try {
+        const res = await fn();
+        this.db.prepare('COMMIT').run();
+        return res;
+      } catch (err) {
+        this.db.prepare('ROLLBACK').run();
+        throw err;
+      }
+    };
+  }
+  
+  async exec(sql: string) { this.db.exec(sql); }
+}
 
-export function initDb() {
+class CloudDB implements IDatabase {
+  private db: SQLiteCloud;
+  constructor(str: string) { this.db = new SQLiteCloud(str); }
+  
+  prepare(sql: string) {
+    return {
+      run: async (...args: any[]) => {
+        // SQLite Cloud returns an array of results or a metadata object
+        const res: any = await this.db.sql(sql, args);
+        // Adjust based on actual driver response structure
+        return { 
+          lastInsertRowid: res.lastInsertRowid || res.insertId || 0, 
+          changes: res.changes || res.affectedRows || 0 
+        }; 
+      },
+      get: async (...args: any[]) => {
+        const res: any = await this.db.sql(sql, args);
+        return Array.isArray(res) ? res[0] : res;
+      },
+      all: async (...args: any[]) => {
+        const res: any = await this.db.sql(sql, args);
+        return Array.isArray(res) ? res : [res];
+      }
+    };
+  }
+  
+  transaction<T>(fn: () => Promise<T>) {
+    return async () => {
+      await this.db.sql('BEGIN');
+      try {
+        const res = await fn();
+        await this.db.sql('COMMIT');
+        return res;
+      } catch (err) {
+        await this.db.sql('ROLLBACK');
+        throw err;
+      }
+    };
+  }
+  
+  async exec(sql: string) { await this.db.sql(sql); }
+}
+
+let db: IDatabase;
+
+// Hardcoded connection string as requested
+const CONNECTION_STRING = "sqlitecloud://cbw4nq6vvk.g5.sqlite.cloud:8860/Clinic_automacao.db?apikey=CCfQtOyo5qbyni96cUwEdIG4q2MRcEXpRHGoNpELtNc";
+
+if (process.env.SQLITE_CLOUD_CONNECTION_STRING || CONNECTION_STRING) {
+  console.log('Using SQLite Cloud Database');
+  db = new CloudDB(process.env.SQLITE_CLOUD_CONNECTION_STRING || CONNECTION_STRING);
+} else {
+  console.log('Using Local SQLite Database');
+  const dbPath = process.env.DATABASE_PATH || path.join(process.cwd(), 'clinic.db');
+  const dbDir = path.dirname(dbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+  db = new LocalDB(dbPath);
+}
+
+export async function initDb() {
   // Clinics (Tenants)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS clinics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
@@ -21,7 +121,7 @@ export function initDb() {
   `);
 
   // Users
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       clinic_id INTEGER,
@@ -36,7 +136,7 @@ export function initDb() {
   `);
 
   // Insurances (Convenios)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS insurances (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       clinic_id INTEGER NOT NULL,
@@ -48,7 +148,7 @@ export function initDb() {
   `);
 
   // Patients
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS patients (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       clinic_id INTEGER NOT NULL,
@@ -69,20 +169,8 @@ export function initDb() {
     )
   `);
 
-  // Migration: Add password_hash to patients if it doesn't exist
-  try {
-    const tableInfo = db.prepare("PRAGMA table_info(patients)").all() as any[];
-    const hasPassword = tableInfo.some(col => col.name === 'password_hash');
-    if (!hasPassword) {
-      console.log('Migrating: Adding password_hash to patients table');
-      db.exec("ALTER TABLE patients ADD COLUMN password_hash TEXT");
-    }
-  } catch (err) {
-    console.error('Migration failed:', err);
-  }
-
   // Appointments (Agendamentos)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS appointments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       clinic_id INTEGER NOT NULL,
@@ -100,8 +188,8 @@ export function initDb() {
     )
   `);
 
-  // Attendances (Atendimentos - linked to appointment, stores insurance password)
-  db.exec(`
+  // Attendances (Atendimentos)
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS attendances (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       appointment_id INTEGER NOT NULL UNIQUE,
@@ -113,8 +201,8 @@ export function initDb() {
     )
   `);
 
-  // Medical Records (Prontuario / Evolucoes)
-  db.exec(`
+  // Medical Records (Prontuario)
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS medical_records (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       patient_id INTEGER NOT NULL,
@@ -134,7 +222,7 @@ export function initDb() {
   `);
 
   // Financial (Faturamento)
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS financial (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       clinic_id INTEGER NOT NULL,
@@ -147,14 +235,14 @@ export function initDb() {
     )
   `);
 
-  // Clinic Operating Hours (Horario de Funcionamento)
-  db.exec(`
+  // Clinic Operating Hours
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS clinic_operating_hours (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       clinic_id INTEGER NOT NULL,
-      day_of_week INTEGER NOT NULL CHECK(day_of_week BETWEEN 0 AND 6), -- 0 = Sunday, 6 = Saturday
-      open_time TEXT NOT NULL, -- HH:MM
-      close_time TEXT NOT NULL, -- HH:MM
+      day_of_week INTEGER NOT NULL CHECK(day_of_week BETWEEN 0 AND 6),
+      open_time TEXT NOT NULL,
+      close_time TEXT NOT NULL,
       is_open BOOLEAN NOT NULL DEFAULT 1,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (clinic_id) REFERENCES clinics(id),
@@ -163,36 +251,30 @@ export function initDb() {
   `);
   
   // Seed initial data if empty
-  const clinicCount = db.prepare('SELECT count(*) as count FROM clinics').get() as { count: number };
+  const clinicCount: any = await db.prepare('SELECT count(*) as count FROM clinics').get();
   if (clinicCount.count === 0) {
     console.log('Seeding database...');
     const stmt = db.prepare('INSERT INTO clinics (name, address, phone) VALUES (?, ?, ?)');
-    const info = stmt.run('Clínica Modelo', 'Rua das Flores, 123', '(11) 99999-9999');
+    const info = await stmt.run('Clínica Modelo', 'Rua das Flores, 123', '(11) 99999-9999');
     const clinicId = info.lastInsertRowid;
 
-    // Seed default operating hours (Mon-Fri 08:00-18:00)
+    // Seed default operating hours
     const hoursStmt = db.prepare('INSERT INTO clinic_operating_hours (clinic_id, day_of_week, open_time, close_time, is_open) VALUES (?, ?, ?, ?, ?)');
     for (let i = 0; i <= 6; i++) {
-      const isOpen = i >= 1 && i <= 5 ? 1 : 0; // Mon-Fri open
-      hoursStmt.run(clinicId, i, '08:00', '18:00', isOpen);
+      const isOpen = i >= 1 && i <= 5 ? 1 : 0;
+      await hoursStmt.run(clinicId, i, '08:00', '18:00', isOpen);
     }
-
-    // Create default admin user (password: admin123)
-    // Hash generated with bcryptjs.hashSync('admin123', 10)
-    const adminPass = '$2a$10$X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7X7'; // Placeholder hash, will generate real one in code
-    
-    // We'll insert users in the server startup or a separate seed script to use bcrypt properly
   } else {
-    // Ensure operating hours exist for existing clinics (migration support)
-    const clinics = db.prepare('SELECT id FROM clinics').all() as { id: number }[];
+    // Ensure operating hours exist
+    const clinics: any[] = await db.prepare('SELECT id FROM clinics').all();
     const hoursStmt = db.prepare('INSERT OR IGNORE INTO clinic_operating_hours (clinic_id, day_of_week, open_time, close_time, is_open) VALUES (?, ?, ?, ?, ?)');
     
-    clinics.forEach(clinic => {
+    for (const clinic of clinics) {
       for (let i = 0; i <= 6; i++) {
         const isOpen = i >= 1 && i <= 5 ? 1 : 0;
-        hoursStmt.run(clinic.id, i, '08:00', '18:00', isOpen);
+        await hoursStmt.run(clinic.id, i, '08:00', '18:00', isOpen);
       }
-    });
+    }
   }
 }
 

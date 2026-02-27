@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: clinic-saas
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /data/clinic.db
+    disk:
+      name: sqlite-data
+      mountPath: /data
+      sizeGB: 1
